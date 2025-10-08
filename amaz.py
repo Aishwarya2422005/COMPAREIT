@@ -17,6 +17,240 @@ import pickle
 import logging
 from win32com.client import Dispatch
 from textblob import TextBlob
+# Add this improved filtering system to your amaz.py file
+
+import re
+from difflib import SequenceMatcher
+
+def calculate_relevance_score(title, search_term):
+    """
+    Calculate how relevant a product title is to the search term
+    Returns a score between 0 and 1 (higher = more relevant)
+    """
+    title_lower = title.lower()
+    search_lower = search_term.lower()
+    
+    # Basic string similarity
+    similarity = SequenceMatcher(None, title_lower, search_lower).ratio()
+    
+    # Boost score if search terms appear in title
+    search_words = search_lower.split()
+    title_words = title_lower.split()
+    
+    word_matches = 0
+    for search_word in search_words:
+        if len(search_word) > 2:  # Ignore very short words
+            for title_word in title_words:
+                if search_word in title_word or title_word in search_word:
+                    word_matches += 1
+                    break
+    
+    word_match_score = word_matches / len(search_words) if search_words else 0
+    
+    # Combined score (60% word matching, 40% string similarity)
+    final_score = (word_match_score * 0.6) + (similarity * 0.4)
+    
+    return final_score
+
+def is_likely_accessory(title):
+    """
+    Detect if a product is likely an accessory or add-on item
+    """
+    title_lower = title.lower()
+    
+    # Common accessory indicators
+    accessory_keywords = [
+        'case', 'cover', 'screen protector', 'tempered glass', 'film',
+        'charger', 'charging cable', 'usb cable', 'adapter', 'dock',
+        'holder', 'stand', 'mount', 'grip', 'ring holder',
+        'headphones', 'earphones', 'earbuds', 'headset',
+        'bag', 'pouch', 'wallet', 'sleeve', 'skin', 'sticker',
+        'stylus', 'pen', 'cleaning', 'cloth', 'wipe',
+        'replacement', 'spare', 'extra', 'additional',
+        'compatible with', 'for samsung', 'for iphone', 'for xiaomi'
+    ]
+    
+    # Check for accessory patterns
+    for keyword in accessory_keywords:
+        if keyword in title_lower:
+            return True
+    
+    # Pattern-based detection
+    accessory_patterns = [
+        r'for\s+\w+',  # "for Samsung", "for iPhone"
+        r'\d+\s*pack',  # "3 pack", "5-pack"
+        r'set of \d+',  # "set of 2"
+        r'compatible',  # any compatibility mention
+        r'replacement',  # replacement parts
+    ]
+    
+    for pattern in accessory_patterns:
+        if re.search(pattern, title_lower):
+            return True
+    
+    return False
+
+def is_bundle_or_combo(title):
+    """
+    Detect bundle deals or combo packs that might not be the main product
+    """
+    title_lower = title.lower()
+    
+    bundle_indicators = [
+        'bundle', 'combo', 'pack of', 'set of', '+ free',
+        'with accessories', 'complete kit', 'starter kit'
+    ]
+    
+    return any(indicator in title_lower for indicator in bundle_indicators)
+
+def filter_and_rank_products(products, search_term, max_results=5):
+    """
+    Filter out irrelevant products and rank by relevance
+    """
+    filtered_products = []
+    
+    for product in products:
+        title = product[0] if isinstance(product, list) else product.get('title', '')
+        
+        # Skip if title is empty or too short
+        if not title or len(title.strip()) < 5:
+            continue
+        
+        # Calculate relevance score
+        relevance = calculate_relevance_score(title, search_term)
+        
+        # Apply penalties for accessories and bundles
+        penalty = 0
+        if is_likely_accessory(title):
+            penalty += 0.3
+        if is_bundle_or_combo(title):
+            penalty += 0.1
+        
+        final_score = max(0, relevance - penalty)
+        
+        # Only keep products with reasonable relevance
+        if final_score > 0.2:
+            if isinstance(product, list):
+                filtered_products.append((*product, final_score))
+            else:
+                product['relevance_score'] = final_score
+                filtered_products.append(product)
+    
+    # Sort by relevance score (highest first)
+    if isinstance(filtered_products[0], dict):
+        filtered_products.sort(key=lambda x: x.get('relevance_score', 0), reverse=True)
+        # Remove the score from final results
+        for product in filtered_products:
+            product.pop('relevance_score', None)
+    else:
+        filtered_products.sort(key=lambda x: x[-1], reverse=True)
+        # Remove the score from final results (keep original format)
+        filtered_products = [product[:-1] for product in filtered_products]
+    
+    return filtered_products[:max_results]
+
+# Modified function for Amazon search
+def find_multiple_products_improved(search_term, driver_path, max_products=5):
+    """
+    Improved version that filters out accessories and ranks by relevance
+    """
+    search_term_encoded = search_term.replace(' ', '+')
+    amazon_link = f"https://www.amazon.in/s?k={search_term_encoded}"
+    amazon_home = 'https://www.amazon.in'
+    max_retries = 3
+    retry_count = 0
+    
+    all_products = []
+    
+    while retry_count < max_retries:
+        try:
+            html = get_html(amazon_link, driver_path)
+            log_debug("Parsing HTML with BeautifulSoup...")
+            soup = BeautifulSoup(html, 'lxml')
+            
+            selectors = [
+                'div[data-component-type="s-search-result"]',
+                'div.s-result-item',
+                'div.sg-col-inner'
+            ]
+            
+            prod_cards = []
+            for selector in selectors:
+                prod_cards = soup.select(selector)
+                if prod_cards:
+                    log_debug(f"Found {len(prod_cards)} products using selector: {selector}")
+                    break
+            
+            if not prod_cards:
+                retry_count += 1
+                log_debug(f"No products found. Retry {retry_count}/{max_retries}")
+                time.sleep(random.uniform(5, 10))
+                continue
+            
+            # Extract more products initially to have more options for filtering
+            for idx, card in enumerate(prod_cards[:max_products*3]):
+                try:
+                    title_elem = (card.select_one('h2 a.a-link-normal span') or 
+                                card.select_one('h2 span.a-text-normal') or
+                                card.select_one('h2'))
+                    
+                    if not title_elem:
+                        continue
+                        
+                    title = title_elem.text.strip()
+                    
+                    link_elem = card.select_one('h2 a') or card.select_one('a.a-link-normal')
+                    if not link_elem:
+                        continue
+                        
+                    link = link_elem.get('href', '')
+                    if not link.startswith('http'):
+                        link = amazon_home + link
+                    
+                    price = extract_price(card)
+                    
+                    if title and link and price != float('inf'):
+                        # Check for duplicates
+                        duplicate = False
+                        for existing_product in all_products:
+                            if existing_product[2] == link:
+                                duplicate = True
+                                break
+                        
+                        if not duplicate:
+                            all_products.append([title, price, link])
+                
+                except Exception as e:
+                    log_debug(f"Error processing product {idx + 1}: {str(e)}")
+                    continue
+            
+            if all_products:
+                # Apply intelligent filtering and ranking
+                filtered_products = filter_and_rank_products(all_products, search_term, max_products)
+                
+                # Sort by price within the filtered results
+                filtered_products.sort(key=lambda x: x[1])
+                
+                print(f"\nFound {len(all_products)} total products, filtered to {len(filtered_products)} relevant ones:")
+                for i, product in enumerate(filtered_products, 1):
+                    print(f"{i}. {product[0][:70]}...")
+                    print(f"   Price: ₹{product[1]:,.2f}")
+                    print("---")
+                
+                return filtered_products
+            
+        except Exception as e:
+            retry_count += 1
+            log_debug(f"Error during scraping (attempt {retry_count}/{max_retries}): {str(e)}")
+            if retry_count < max_retries:
+                time.sleep(random.uniform(5, 10))
+            else:
+                print(f"Error during scraping: {str(e)}")
+    
+    return []
+
+# Usage example - replace your existing find_multiple_products calls with this:
+# products = find_multiple_products_improved(search_term, driver_path, max_products=5)
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")

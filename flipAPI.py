@@ -43,12 +43,13 @@ class FlipkartProductSearch:
             browser.get(flipkart_link)
             time.sleep(10)  # Extended wait time
             
-            # Try multiple strategies to find product elements
+            # Updated product container selectors based on provided CSS
             product_strategies = [
-                (By.CSS_SELECTOR, 'div[data-id]'),
-                (By.CSS_SELECTOR, 'div._1AtVbE'),
-                (By.XPATH, '//div[contains(@class, "product")]'),
-                (By.XPATH, '//a[contains(@href, "/p/")]/../..')
+                (By.CSS_SELECTOR, 'div.cPHDOP'),  # Main product container
+                (By.CSS_SELECTOR, 'div[class*="cPHDOP"]'),  # Alternative match
+                (By.CSS_SELECTOR, 'div.col-12-12'),  # Column container
+                (By.XPATH, '//div[contains(@class, "cPHDOP")]'),
+                (By.XPATH, '//div[contains(@class, "col-12-12")]')
             ]
             
             products_found = False
@@ -70,56 +71,109 @@ class FlipkartProductSearch:
                     f.write(browser.page_source)
                 return []
             
-            # Process the first 5 products
-            for idx, container in enumerate(product_containers[:5], 1):
+            # Process the first 10 products
+            for idx, container in enumerate(product_containers[:10], 1):
                 try:
-                    # More comprehensive title extraction
+                    # Updated title extraction based on CSS selectors
                     title_selectors = [
-                        './/a[contains(@href, "/p/")]//div[@class="_4rR01t"]',
-                        './/div[contains(@class, "_4rR01t")]',
-                        './/a[contains(@class, "s1Q9rs")]',
-                        './/a[contains(@href, "/p/")]',
-                        './/div[contains(@class, "product-title")]'
+                        './/div[@class="KzDlHZ"]',  # Primary title selector
+                        './/div[contains(@class, "KzDlHZ")]',
+                        './/a[contains(@class, "wjcEIp")]',  # Link with title
+                        './/div[@class="syl9yP"]',  # Alternative title
+                        './/a[contains(@href, "/p/")]'  # Fallback link selector
                     ]
                     
                     title = "Title Not Available"
+                    product_link = None
+                    
                     for selector in title_selectors:
                         try:
                             title_elem = container.find_element(By.XPATH, selector)
                             candidate_title = title_elem.text.strip()
-                            if candidate_title and candidate_title != "Add to Compare":
+                            if candidate_title and len(candidate_title) > 5:
                                 title = candidate_title
+                                # Try to get link from the same element or parent
+                                try:
+                                    if title_elem.tag_name == 'a':
+                                        product_link = title_elem.get_attribute('href')
+                                    else:
+                                        link_elem = title_elem.find_element(By.XPATH, './/ancestor::a | .//a')
+                                        product_link = link_elem.get_attribute('href')
+                                except:
+                                    pass
                                 break
                         except:
                             continue
                     
-                    # Price extraction with multiple attempts
-                    try:
-                        price_elem = container.find_element(By.XPATH, './/div[contains(@class, "_30jeq3") or contains(text(), "₹")]')
-                        price_text = price_elem.text.replace('₹','').replace(',','')
-                        price = float(price_text) if price_text.replace('.', '', 1).isdigit() else float('inf')
-                    except:
-                        price = float('inf')
+                    # Updated price extraction based on CSS selectors
+                    price = float('inf')
+                    price_text = "Price Not Available"
                     
-                    # Link extraction
-                    try:
-                        link_elem = container.find_element(By.XPATH, './/a[contains(@href, "/p/")]')
-                        link = link_elem.get_attribute('href')
-                    except:
-                        link = None
+                    price_selectors = [
+                        './/div[@class="Nx9bqj"]',  # Primary price selector
+                        './/div[contains(@class, "Nx9bqj")]',
+                        './/div[@class="_4b5DiR"]',  # Alternative price
+                        './/span[contains(text(), "₹")]',  # Any element with rupee symbol
+                        './/div[contains(text(), "₹")]'
+                    ]
+                    
+                    for selector in price_selectors:
+                        try:
+                            price_elem = container.find_element(By.XPATH, selector)
+                            price_text_raw = price_elem.text.strip()
+                            if '₹' in price_text_raw:
+                                # Clean price text
+                                clean_price = price_text_raw.replace('₹', '').replace(',', '').strip()
+                                # Extract first number (in case of range)
+                                price_numbers = ''.join(filter(lambda x: x.isdigit() or x == '.', clean_price.split()[0]))
+                                if price_numbers:
+                                    price = float(price_numbers)
+                                    price_text = price_text_raw
+                                    break
+                        except:
+                            continue
+                    
+                    # Try to find product link if not found yet
+                    if not product_link:
+                        link_selectors = [
+                            './/a[contains(@href, "/p/")]',
+                            './/a[@class="wjcEIp"]',
+                            './/a[contains(@class, "wjcEIp")]'
+                        ]
+                        
+                        for selector in link_selectors:
+                            try:
+                                link_elem = container.find_element(By.XPATH, selector)
+                                product_link = link_elem.get_attribute('href')
+                                if product_link:
+                                    break
+                            except:
+                                continue
                     
                     # Add to products list if we have valid data
-                    if title != "Title Not Available" and price != float('inf') and link:
+                    if title != "Title Not Available" and price != float('inf') and product_link:
                         self.products.append({
                             'title': title,
                             'price': price,
-                            'price_text': f"₹{price:,.2f}",
-                            'link': link
+                            'price_text': price_text,
+                            'link': product_link
                         })
                         print(f"\nProduct {idx}:")
                         print(f"Title: {title}")
-                        print(f"Price: ₹{price:,.2f}")
-                        print(f"Link: {link}")
+                        print(f"Price: {price_text}")
+                        print(f"Link: {product_link}")
+                    
+                    # Also add products with missing price but valid title and link
+                    elif title != "Title Not Available" and product_link:
+                        self.products.append({
+                            'title': title,
+                            'price': float('inf'),
+                            'price_text': "Price Not Available",
+                            'link': product_link
+                        })
+                        print(f"\nProduct {idx} (No price found):")
+                        print(f"Title: {title}")
+                        print(f"Link: {product_link}")
                 
                 except Exception as e:
                     print(f"Error processing product {idx}: {e}")
@@ -140,8 +194,15 @@ class FlipkartProductSearch:
         if not self.products:
             return None
         
+        # Filter out products with no price and sort by price
+        products_with_price = [p for p in self.products if p['price'] != float('inf')]
+        
+        if not products_with_price:
+            # If no products have price, return the first one
+            return self.products[0]
+        
         # Sort products by price and get the cheapest one
-        sorted_products = sorted(self.products, key=lambda x: x['price'])
+        sorted_products = sorted(products_with_price, key=lambda x: x['price'])
         return sorted_products[0]
 
 
@@ -218,10 +279,26 @@ class FlipkartReviewScraper:
         """Navigate to the reviews section from product page"""
         logger.info("Attempting to find and click on reviews section...")
         
-        # First, make sure we're on a product page by checking for common elements
+        # Updated product title selectors
         try:
-            product_title = self.driver.find_elements(By.XPATH, "//span[@class='B_NuCI']")
-            if not product_title:
+            title_selectors = [
+                "//span[@class='VU-ZEz']",  # Updated product title selector
+                "//h1[@class='yhB1nd']",
+                "//span[contains(@class, 'VU-ZEz')]"
+            ]
+            
+            product_title_found = False
+            for selector in title_selectors:
+                try:
+                    product_title = self.driver.find_elements(By.XPATH, selector)
+                    if product_title:
+                        product_title_found = True
+                        logger.info(f"Found product title: {product_title[0].text[:50]}...")
+                        break
+                except:
+                    continue
+                    
+            if not product_title_found:
                 logger.warning("This doesn't appear to be a product page")
         except:
             pass
@@ -231,15 +308,16 @@ class FlipkartReviewScraper:
             self.driver.execute_script("window.scrollBy(0, 500)")
             time.sleep(1)
         
-        # Try various review section selectors
+        # Updated review section selectors
         review_selectors = [
             "//div[text()='Ratings & Reviews']",
             "//div[contains(text(), 'Ratings & Reviews')]",
-            "//div[contains(@class, '_3UAT2v')]",
             "//div[contains(text(), 'Customer Reviews')]",
             "//div[contains(text(), 'All Reviews')]",
             "//a[contains(text(), 'All reviews')]",
-            "//button[contains(text(), 'All reviews')]"
+            "//button[contains(text(), 'All reviews')]",
+            "//span[contains(text(), 'Reviews')]",
+            "//div[@class='col-3-12']//span[contains(text(), 'Reviews')]"
         ]
         
         for selector in review_selectors:
@@ -258,9 +336,8 @@ class FlipkartReviewScraper:
             except:
                 continue
         
-        # If we can't find a review section, try to find a direct "All Reviews" link
+        # Try to find review count and click it
         try:
-            # Search for text containing review counts
             review_count_elements = self.driver.find_elements(By.XPATH, 
                 "//span[contains(text(), 'Reviews') and contains(text(), ',')]")
             
@@ -294,13 +371,15 @@ class FlipkartReviewScraper:
         self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight/2);")
         time.sleep(2)
         
-        # Try different selectors for review titles
+        # Updated review title selectors
         title_selectors = [
-            "//p[@class='_2-N8zT']",
-            "//div[@class='_2sc7ZR _2V5EHH']",
-            "//div[contains(@class, '_2sc7ZR')]",
-            "//p[contains(@class, '_2-N8zT')]",
-            "//div[contains(@class, 't-ZTKy')]/div[1]"
+            "//p[@class='z9E0IG']",  # Updated review title selector
+            "//div[@class='ZmyHeo']",  # Alternative title selector
+            "//p[contains(@class, 'z9E0IG')]",
+            "//div[contains(@class, 'ZmyHeo')]",
+            "//div[contains(@class, 't-ZTKy')]/div[1]",
+            "//p[@class='_2-N8zT']",  # Fallback to old selector
+            "//div[@class='_2sc7ZR _2V5EHH']"
         ]
         
         for selector in title_selectors:
@@ -312,7 +391,8 @@ class FlipkartReviewScraper:
                         title = title_element.text.strip()
                         if title and len(title) > 3:  # Ensure it's a meaningful title
                             review_titles.append(title)
-                    break
+                    if review_titles:  # If we found titles with this selector, break
+                        break
             except Exception as e:
                 logger.debug(f"Error with selector {selector}: {e}")
         
@@ -330,9 +410,11 @@ class FlipkartReviewScraper:
         self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
         time.sleep(2)
         
-        # Try different review selectors
+        # Updated review content selectors
         review_selectors = [
-            "//div[@class='t-ZTKy']",
+            "//div[@class='ZmyHeo']",  # Updated review content selector
+            "//div[contains(@class, 'ZmyHeo')]",
+            "//div[@class='t-ZTKy']",  # Fallback to old selector
             "//div[@class='_6K-7Co']",
             "//div[contains(@class, 't-ZTKy')]",
             "//div[contains(@class, '_6K-7Co')]"
@@ -358,41 +440,26 @@ class FlipkartReviewScraper:
             except Exception as e:
                 logger.debug(f"Error extracting review text: {e}")
         
-        # If we found no reviews, take a more aggressive approach
+        # If we found no reviews, try a more general approach
         if not reviews:
             logger.warning("No reviews found with specific selectors. Trying general text elements...")
             try:
-                # Look for any elements with substantial text
+                # Look for any elements with substantial text that might be reviews
                 text_elements = self.driver.find_elements(By.XPATH, 
-                    "//div[string-length(text()) > 30]")
+                    "//div[string-length(text()) > 30 and not(contains(@class, 'nav')) and not(contains(@class, 'header'))]")
                 
                 for element in text_elements:
                     try:
                         text = element.text.strip()
                         if text and len(text) > 30 and text not in reviews:
-                            reviews.append(text)
+                            # Basic check to see if it might be a review
+                            if any(word in text.lower() for word in ['good', 'bad', 'excellent', 'terrible', 'nice', 'poor', 'great', 'worst', 'best', 'recommend', 'buy', 'product']):
+                                reviews.append(text)
                     except:
                         continue
             except Exception as e:
                 logger.error(f"Error finding text elements: {e}")
         
-        # If we're on a product page, not a review page, try to extract the review summary
-        if not reviews:
-            logger.warning("No reviews found. Checking if we can extract product ratings...")
-            try:
-                rating_elements = self.driver.find_elements(By.XPATH, 
-                    "//div[contains(@class, '_3LWZlK')]")
-                
-                for element in rating_elements:
-                    try:
-                        rating = element.text.strip()
-                        if rating:
-                            reviews.append(f"Product Rating: {rating}")
-                    except:
-                        continue
-            except:
-                pass
-                
         return reviews
     
     def go_to_next_page(self):
@@ -406,7 +473,8 @@ class FlipkartReviewScraper:
                 "//a[@class='_1LKTO3']",
                 "//span[contains(text(), 'Next')]//parent::a",
                 "//a[contains(text(), 'Next')]",
-                "//a[contains(@class, '_1LKTO3') and contains(text(), 'Next')]"
+                "//a[contains(@class, '_1LKTO3') and contains(text(), 'Next')]",
+                "//button[contains(text(), 'Next')]"
             ]
             
             for selector in next_button_selectors:
@@ -468,11 +536,12 @@ class FlipkartReviewScraper:
         product_info = {}
         
         try:
-            # Try to extract product name
+            # Updated product name selectors
             name_selectors = [
-                "//span[@class='B_NuCI']",
+                "//span[@class='VU-ZEz']",  # Updated product name selector
                 "//h1[@class='yhB1nd']",
-                "//span[contains(@class, 'B_NuCI')]",
+                "//span[contains(@class, 'VU-ZEz')]",
+                "//span[@class='B_NuCI']",  # Fallback
                 "//h1[contains(@class, 'yhB1nd')]"
             ]
             
@@ -485,9 +554,11 @@ class FlipkartReviewScraper:
                 except:
                     continue
             
-            # Try to extract product price
+            # Updated product price selectors
             price_selectors = [
-                "//div[@class='_30jeq3 _16Jk6d']",
+                "//div[@class='Nx9bqj _4b5DiR']",  # Updated price selector
+                "//div[contains(@class, 'Nx9bqj')]",
+                "//div[@class='_30jeq3 _16Jk6d']",  # Fallback
                 "//div[contains(@class, '_30jeq3')]",
                 "//div[contains(@class, 'price')]"
             ]
@@ -564,8 +635,7 @@ class FlipkartReviewScraper:
             all_reviews = list(set(all_reviews))
             all_titles = list(set(all_titles))
             
-            # If we haven't got any reviews, try one more approach - if the URL is not a review URL,
-            # try to convert it to a reviews URL directly
+            # If we haven't got any reviews, try one more approach
             if not all_reviews and not all_titles and "product-reviews" not in product_url:
                 try:
                     logger.info("Attempting to construct a direct review URL...")

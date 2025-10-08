@@ -10,9 +10,12 @@ import random
 from textblob import TextBlob
 from hashlib import sha256
 import sqlite3
+from price_predictor import PricePredictor, PricePredictionDatabase
+import plotly.graph_objects as go
+from price_alert_system import PriceAlertSystem
 
 # Import functions from your existing scripts 
-from amaz import setup_chrome_driver, find_lowest_price_product, find_multiple_products, AmazonReviewScraper
+from amaz import setup_chrome_driver, find_lowest_price_product, find_multiple_products, AmazonReviewScraper,find_multiple_products_improved
 from flipAPI import FlipkartProductSearch, FlipkartReviewScraper
 
 # Set up logging
@@ -32,7 +35,14 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded"
 )
+SMTP_CONFIG = {
+    'smtp_server': 'smtp.gmail.com',
+    'smtp_port': 587,
+    'from_email': 'compareshoppingassitant@gmail.com',  # Replace with your email
+    'password': 'xmjx aanv vhsz tjjb'  # Replace with Gmail app password
+}
 
+# User Authentication Database Setup
 # User Authentication Database Setup
 def create_userdb():
     conn = sqlite3.connect("userdb.db")
@@ -40,18 +50,20 @@ def create_userdb():
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS users (
             username TEXT PRIMARY KEY,
-            password TEXT NOT NULL
+            password TEXT NOT NULL,
+            email TEXT NOT NULL
         )
     """)
     conn.commit()
     conn.close()
 
-def add_user(username, password):
+def add_user(username, password, email):
     conn = sqlite3.connect("userdb.db")
     cursor = conn.cursor()
     try:
         hashed_password = sha256(password.encode()).hexdigest()
-        cursor.execute("INSERT INTO users (username, password) VALUES (?, ?)", (username, hashed_password))
+        cursor.execute("INSERT INTO users (username, password, email) VALUES (?, ?, ?)", 
+                      (username, hashed_password, email))
         conn.commit()
         conn.close()
         return True
@@ -63,10 +75,20 @@ def authenticate_user(username, password):
     conn = sqlite3.connect("userdb.db")
     cursor = conn.cursor()
     hashed_password = sha256(password.encode()).hexdigest()
-    cursor.execute("SELECT * FROM users WHERE username = ? AND password = ?", (username, hashed_password))
+    cursor.execute("SELECT * FROM users WHERE username = ? AND password = ?", 
+                  (username, hashed_password))
     result = cursor.fetchone()
     conn.close()
     return result
+
+def get_user_email(username):
+    """Get the email address for a given username"""
+    conn = sqlite3.connect("userdb.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT email FROM users WHERE username = ?", (username,))
+    result = cursor.fetchone()
+    conn.close()
+    return result[0] if result else None
 
 # Create user database on startup
 create_userdb()
@@ -90,6 +112,15 @@ if 'max_review_pages' not in st.session_state:
     st.session_state.max_review_pages = 2
 if 'driver_path' not in st.session_state:
     st.session_state.driver_path = "chromedriver.exe"
+# ADD THESE NEW SESSION STATES HERE:
+if 'price_predictions_flipkart' not in st.session_state:
+    st.session_state.price_predictions_flipkart = None
+if 'price_predictions_amazon' not in st.session_state:
+    st.session_state.price_predictions_amazon = None
+if 'predictor' not in st.session_state:
+    st.session_state.predictor = PricePredictor()
+if 'alert_system' not in st.session_state:
+    st.session_state.alert_system = PriceAlertSystem()
 
 st.markdown("""
 <style>
@@ -219,6 +250,27 @@ st.markdown("""
         padding: 20px;
         border-top: 1px solid #DDD;
     }
+    .prediction-card {
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        color: white;
+        padding: 15px;
+        border-radius: 10px;
+        margin: 10px 0;
+    }
+    .prediction-insight {
+        background-color: #f8f9fa;
+        border-left: 4px solid #007bff;
+        padding: 10px;
+        margin: 10px 0;
+    }
+    .trend-up {
+        color: #dc3545;
+        font-weight: bold;
+    }
+    .trend-down {
+        color: #28a745;
+        font-weight: bold;
+    }
     .platform-logo {
         display: block;
         margin: 0 auto;
@@ -347,13 +399,20 @@ def show_login_page():
     
     with tab2:
         new_username = st.text_input("New Username", key="signup_username")
+        new_email = st.text_input("Email Address", key="signup_email", 
+                                   placeholder="your.email@example.com")
         new_password = st.text_input("New Password", type="password", key="signup_password")
-        confirm_password = st.text_input("Confirm Password", type="password", key="confirm_password")
+        confirm_password = st.text_input("Confirm Password", type="password", 
+                                        key="confirm_password")
         
         if st.button("Sign Up", key="signup_button"):
-            if new_password != confirm_password:
+            if not new_email or "@" not in new_email or "." not in new_email:
+                st.error("Please enter a valid email address.")
+            elif new_password != confirm_password:
                 st.error("Passwords do not match.")
-            elif add_user(new_username, new_password):
+            elif len(new_password) < 6:
+                st.error("Password must be at least 6 characters long.")
+            elif add_user(new_username, new_password, new_email):
                 st.success("Account created successfully! You can now login.")
             else:
                 st.error("Username already exists. Please choose a different one.")
@@ -372,6 +431,46 @@ def show_main_app():
         """, 
         unsafe_allow_html=True
     )
+    def show_price_alerts_section():
+        st.markdown("---")
+        st.markdown("### 🔔 Price Alerts")
+        
+        if st.session_state.logged_in:
+            user_email = get_user_email(st.session_state.username)
+            
+            if not user_email:
+                st.warning("⚠️ No email found. Please contact support.")
+                return
+            
+            alerts = st.session_state.alert_system.get_user_alerts(user_email)
+            
+            if alerts:
+                st.write(f"You have {len(alerts)} active alert(s)")
+                st.caption(f"Alerts sent to: {user_email}")
+                
+                with st.expander("Manage Alerts"):
+                    for alert in alerts:
+                        alert_id, product_name, platform, current_price, target_price, product_url = alert
+                        
+                        col1, col2 = st.columns([3, 1])
+                        with col1:
+                            st.write(f"**{product_name[:30]}...**")
+                            st.write(f"{platform} - ₹{current_price:,.2f}")
+                            if target_price:
+                                st.write(f"Target: ₹{target_price:,.2f}")
+                        
+                        with col2:
+                            if st.button("🗑️", key=f"delete_{alert_id}"):
+                                st.session_state.alert_system.delete_alert(alert_id)
+                                st.success("Alert deleted!")
+                                st.rerun()
+                        
+                        st.markdown("---")
+            else:
+                st.info("No active alerts")
+                st.caption(f"Alerts will be sent to: {user_email}")
+        else:
+            st.info("Login to set up price alerts")
     # Sidebar configuration
     with st.sidebar:
         st.markdown("### ⚙️ Settings")
@@ -393,6 +492,9 @@ def show_main_app():
             wait_time = st.slider("Page load wait time (seconds)", 2, 10, 5)
             debug_mode = st.checkbox("Enable debug mode", False)
         
+        show_price_alerts_section()
+        
+        
         st.markdown("---")
         st.markdown("### 📖 How to use")
         st.markdown("""
@@ -403,7 +505,7 @@ def show_main_app():
         5. Click 'Analyze Reviews' to see sentiment from both platforms
         6. Make your final buying decision based on price and sentiment
         """)
-
+        
     # Initialize session state for both platforms
     if 'flipkart_selected_product' not in st.session_state:
         st.session_state.flipkart_selected_product = None
@@ -471,7 +573,7 @@ def show_main_app():
                 
                 # Find multiple products from Amazon
                 try:
-                    amazon_products = find_multiple_products(search_term, driver_path, max_products=5)
+                    amazon_products = find_multiple_products_improved(search_term, driver_path, max_products=5)
                     
                     if amazon_products:
                         st.session_state.amazon_products = amazon_products
@@ -549,12 +651,58 @@ def show_main_app():
             
             st.markdown("</div>", unsafe_allow_html=True)
         
+        def add_alert_button(product_name, product_url, platform, current_price):
+            if st.session_state.logged_in:
+                with st.expander("🔔 Set Price Alert"):
+                    st.write("Get notified when the price drops!")
+                    
+                    # Get user's real email
+                    user_email = get_user_email(st.session_state.username)
+                    
+                    if not user_email:
+                        st.error("❌ Email not found in your account. Please contact support.")
+                        return
+                    
+                    st.info(f"📧 Alerts will be sent to: **{user_email}**")
+                    
+                    # Option to set target price
+                    use_target = st.checkbox("Set target price", value=False, 
+                                            key=f"target_check_{platform}_{product_name[:10]}")
+                    
+                    if use_target:
+                        target_price = st.number_input(
+                            "Alert me when price drops below:",
+                            min_value=0.0,
+                            value=current_price * 0.9,
+                            step=100.0,
+                            key=f"target_price_{platform}_{product_name[:10]}"
+                        )
+                    else:
+                        target_price = None
+                        st.info("You'll be notified of any price drop")
+                    
+                    if st.button("Set Alert", key=f"alert_{platform}_{product_name[:20]}"):
+                        alert_id = st.session_state.alert_system.add_price_alert(
+                            user_email=user_email,
+                            product_name=product_name,
+                            product_url=product_url,
+                            platform=platform,
+                            current_price=current_price,
+                            target_price=target_price
+                        )
+                        
+                        st.success(f"✅ Price alert created! We'll email you at **{user_email}** when the price drops.")
+            else:
+                with st.expander("🔔 Set Price Alert"):
+                    st.warning("Please login to set price alerts")
+        
         # Combined Review Analysis Button (shown only if both products are selected)
         if st.session_state.flipkart_selected_product and st.session_state.amazon_selected_product:
             st.markdown("<div style='text-align: center; margin: 20px 0;'>", unsafe_allow_html=True)
             if st.button("Analyze Reviews on Both Platforms", key="analyze_both", use_container_width=True, 
                     help="This will analyze reviews from both Amazon and Flipkart"):
                 st.session_state.analyze_reviews_clicked = True
+
             st.markdown("</div>", unsafe_allow_html=True)
         
         # WINNER SECTION - Show the best deal across platforms
@@ -593,6 +741,17 @@ def show_main_app():
                     st.markdown(f"<p class='price-lose'>₹{amazon_price:,.2f}</p>", unsafe_allow_html=True)
                     st.markdown(f"[View on Amazon]({amazon_lowest[2]})")
                     st.markdown("</div>", unsafe_allow_html=True)
+                
+                if st.session_state.flipkart_selected_product:
+                    flipkart_product = st.session_state.flipkart_selected_product
+                    flipkart_price = float(flipkart_product['price_text'].replace('₹', '').replace(',', '').strip().split('.')[0])
+                    
+                    add_alert_button(
+                        product_name=flipkart_product['title'],
+                        product_url=flipkart_product['link'],
+                        platform="Flipkart",
+                        current_price=flipkart_price
+                    )
             else:
                 # Amazon wins
                 with winner_col1:
@@ -612,6 +771,16 @@ def show_main_app():
                     st.markdown(f"<p>You save: ₹{(flipkart_price - amazon_price):.2f} ({((flipkart_price - amazon_price) / flipkart_price * 100):.1f}%)</p>", unsafe_allow_html=True)
                     st.markdown(f"[View on Amazon]({amazon_lowest[2]})")
                     st.markdown("</div>", unsafe_allow_html=True)
+                
+                if st.session_state.amazon_selected_product:
+                    amazon_product = st.session_state.amazon_selected_product
+                    
+                    add_alert_button(
+                        product_name=amazon_product[0],
+                        product_url=amazon_product[2],
+                        platform="Amazon",
+                        current_price=amazon_product[1]
+                    )
 
     # Combined review analysis - Execute when the analyze button is clicked
     if st.session_state.analyze_reviews_clicked and st.session_state.flipkart_selected_product and st.session_state.amazon_selected_product:
@@ -1005,6 +1174,262 @@ def show_main_app():
         st.markdown("</div>", unsafe_allow_html=True)
         
         st.markdown("</div>", unsafe_allow_html=True)
+    
+    # Add this code to your pricefull.py file after the price prediction button click
+
+# PRICE PREDICTIONS DISPLAY SECTION - Add this after the predict prices button
+    if st.session_state.price_predictions_flipkart is not None or st.session_state.price_predictions_amazon is not None:
+        st.markdown("<div class='comparison-header'>📊 Price Predictions - Next 30 Days</div>", unsafe_allow_html=True)
+        
+        # Create columns for side-by-side predictions
+        pred_col1, pred_col2 = st.columns(2)
+        
+        # FLIPKART PREDICTIONS
+        with pred_col1:
+            if st.session_state.price_predictions_flipkart is not None:
+                st.markdown("<div class='platform-container flipkart-container'>", unsafe_allow_html=True)
+                st.markdown("<h3 class='platform-header flipkart-header'>Flipkart Price Forecast</h3>", unsafe_allow_html=True)
+                
+                predictions = st.session_state.price_predictions_flipkart
+                if predictions:
+                    # Get current price
+                    flipkart_product = st.session_state.flipkart_selected_product
+                    flipkart_price_text = flipkart_product['price_text']
+                    current_price = float(flipkart_price_text.replace('₹', '').replace(',', '').strip().split('.')[0])
+                    
+                    # Get insights
+                    insights = st.session_state.predictor.get_price_insights(predictions, current_price)
+                    
+                    # Display current vs predicted price
+                    future_price = predictions[-1]['predicted_price']
+                    price_change = future_price - current_price
+                    price_change_percent = (price_change / current_price) * 100
+                    
+                    # Price trend card
+                    st.markdown(f"""
+                    <div class='prediction-card'>
+                        <h4>📈 Price Trend Analysis</h4>
+                        <p><strong>Current Price:</strong> ₹{current_price:,.2f}</p>
+                        <p><strong>Predicted Price (30 days):</strong> ₹{future_price:,.2f}</p>
+                        <p><strong>Expected Change:</strong> 
+                            <span class='{"trend-up" if price_change > 0 else "trend-down"}'>
+                                ₹{abs(price_change):,.2f} ({abs(price_change_percent):.1f}% {"↗️" if price_change > 0 else "↘️"})
+                            </span>
+                        </p>
+                        <p><strong>Confidence:</strong> {insights['confidence']*100:.1f}%</p>
+                    </div>
+                    """, unsafe_allow_html=True)
+                    
+                    # Best buy recommendation
+                    if insights['potential_savings'] > 0:
+                        st.markdown(f"""
+                        <div class='prediction-insight'>
+                            <h4>💡 Best Time to Buy</h4>
+                            <p><strong>Recommended Date:</strong> {insights['best_buy_date']}</p>
+                            <p><strong>Expected Price:</strong> ₹{insights['best_buy_price']:,.2f}</p>
+                            <p><strong>Potential Savings:</strong> ₹{insights['potential_savings']:,.2f} ({insights['potential_savings_percent']:.1f}%)</p>
+                        </div>
+                        """, unsafe_allow_html=True)
+                    
+                    # Create price chart
+                    dates = [pred['date'].strftime('%m/%d') for pred in predictions[:15]]  # Show first 15 days
+                    prices = [pred['predicted_price'] for pred in predictions[:15]]
+                    
+                    chart_data = pd.DataFrame({
+                        'Date': dates,
+                        'Predicted Price': prices
+                    })
+                    
+                    fig = px.line(chart_data, x='Date', y='Predicted Price', 
+                                title='Flipkart Price Forecast (15 days)',
+                                color_discrete_sequence=['#2874F0'])
+                    fig.add_hline(y=current_price, line_dash="dash", 
+                                annotation_text="Current Price", annotation_position="bottom right")
+                    fig.update_layout(height=300)
+                    st.plotly_chart(fig, use_container_width=True)
+                    
+                    # Recommendation based on trend
+                    if price_change_percent < -5:
+                        st.success("🎯 Recommendation: Wait to buy! Price is expected to drop significantly.")
+                    elif price_change_percent > 5:
+                        st.error("⏰ Recommendation: Buy now! Price is expected to increase.")
+                    else:
+                        st.info("💭 Recommendation: Price is expected to remain stable. Buy when convenient.")
+                else:
+                    st.warning("No predictions available for Flipkart product.")
+                
+                st.markdown("</div>", unsafe_allow_html=True)
+        
+        # AMAZON PREDICTIONS
+        with pred_col2:
+            if st.session_state.price_predictions_amazon is not None:
+                st.markdown("<div class='platform-container amazon-container'>", unsafe_allow_html=True)
+                st.markdown("<h3 class='platform-header amazon-header'>Amazon Price Forecast</h3>", unsafe_allow_html=True)
+                
+                predictions = st.session_state.price_predictions_amazon
+                if predictions:
+                    # Get current price
+                    amazon_product = st.session_state.amazon_selected_product
+                    current_price = amazon_product[1]
+                    
+                    # Get insights
+                    insights = st.session_state.predictor.get_price_insights(predictions, current_price)
+                    
+                    # Display current vs predicted price
+                    future_price = predictions[-1]['predicted_price']
+                    price_change = future_price - current_price
+                    price_change_percent = (price_change / current_price) * 100
+                    
+                    # Price trend card
+                    st.markdown(f"""
+                    <div class='prediction-card'>
+                        <h4>📈 Price Trend Analysis</h4>
+                        <p><strong>Current Price:</strong> ₹{current_price:,.2f}</p>
+                        <p><strong>Predicted Price (30 days):</strong> ₹{future_price:,.2f}</p>
+                        <p><strong>Expected Change:</strong> 
+                            <span class='{"trend-up" if price_change > 0 else "trend-down"}'>
+                                ₹{abs(price_change):,.2f} ({abs(price_change_percent):.1f}% {"↗️" if price_change > 0 else "↘️"})
+                            </span>
+                        </p>
+                        <p><strong>Confidence:</strong> {insights['confidence']*100:.1f}%</p>
+                    </div>
+                    """, unsafe_allow_html=True)
+                    
+                    # Best buy recommendation
+                    if insights['potential_savings'] > 0:
+                        st.markdown(f"""
+                        <div class='prediction-insight'>
+                            <h4>💡 Best Time to Buy</h4>
+                            <p><strong>Recommended Date:</strong> {insights['best_buy_date']}</p>
+                            <p><strong>Expected Price:</strong> ₹{insights['best_buy_price']:,.2f}</p>
+                            <p><strong>Potential Savings:</strong> ₹{insights['potential_savings']:,.2f} ({insights['potential_savings_percent']:.1f}%)</p>
+                        </div>
+                        """, unsafe_allow_html=True)
+                    
+                    # Create price chart
+                    dates = [pred['date'].strftime('%m/%d') for pred in predictions[:15]]  # Show first 15 days
+                    prices = [pred['predicted_price'] for pred in predictions[:15]]
+                    
+                    chart_data = pd.DataFrame({
+                        'Date': dates,
+                        'Predicted Price': prices
+                    })
+                    
+                    fig = px.line(chart_data, x='Date', y='Predicted Price', 
+                                title='Amazon Price Forecast (15 days)',
+                                color_discrete_sequence=['#FF9900'])
+                    fig.add_hline(y=current_price, line_dash="dash", 
+                                annotation_text="Current Price", annotation_position="bottom right")
+                    fig.update_layout(height=300)
+                    st.plotly_chart(fig, use_container_width=True)
+                    
+                    # Recommendation based on trend
+                    if price_change_percent < -5:
+                        st.success("🎯 Recommendation: Wait to buy! Price is expected to drop significantly.")
+                    elif price_change_percent > 5:
+                        st.error("⏰ Recommendation: Buy now! Price is expected to increase.")
+                    else:
+                        st.info("💭 Recommendation: Price is expected to remain stable. Buy when convenient.")
+                else:
+                    st.warning("No predictions available for Amazon product.")
+                
+                st.markdown("</div>", unsafe_allow_html=True)
+        
+        # COMBINED PREDICTION SUMMARY
+        if (st.session_state.price_predictions_flipkart is not None and 
+            st.session_state.price_predictions_amazon is not None):
+            
+            st.markdown("<div class='comparison-header'>🔮 Platform Comparison Forecast</div>", unsafe_allow_html=True)
+            
+            # Get both insights
+            flipkart_product = st.session_state.flipkart_selected_product
+            amazon_product = st.session_state.amazon_selected_product
+            
+            flipkart_current = float(flipkart_product['price_text'].replace('₹', '').replace(',', '').strip().split('.')[0])
+            amazon_current = amazon_product[1]
+            
+            flipkart_insights = st.session_state.predictor.get_price_insights(
+                st.session_state.price_predictions_flipkart, flipkart_current)
+            amazon_insights = st.session_state.predictor.get_price_insights(
+                st.session_state.price_predictions_amazon, amazon_current)
+            
+            # Create comparison
+            comparison_col1, comparison_col2 = st.columns(2)
+            
+            with comparison_col1:
+                st.metric(
+                    "Flipkart - Best Future Price",
+                    f"₹{flipkart_insights['best_buy_price']:,.2f}",
+                    f"{flipkart_insights['price_change_percent']:+.1f}%"
+                )
+            
+            with comparison_col2:
+                st.metric(
+                    "Amazon - Best Future Price", 
+                    f"₹{amazon_insights['best_buy_price']:,.2f}",
+                    f"{amazon_insights['price_change_percent']:+.1f}%"
+                )
+            
+            # Overall recommendation
+            flipkart_best = flipkart_insights['best_buy_price']
+            amazon_best = amazon_insights['best_buy_price']
+            
+            if flipkart_best < amazon_best:
+                st.success(f"🏆 Best Overall Forecast: Flipkart will likely have the lowest price (₹{flipkart_best:,.2f}) on {flipkart_insights['best_buy_date']}")
+            elif amazon_best < flipkart_best:
+                st.success(f"🏆 Best Overall Forecast: Amazon will likely have the lowest price (₹{amazon_best:,.2f}) on {amazon_insights['best_buy_date']}")
+            else:
+                st.info("📊 Both platforms are expected to have similar pricing in the future.")
+
+    # Also add this improved error handling for the predict prices button
+    if st.button("🔮 Predict Future Prices", key="predict_prices", use_container_width=True,
+                help="Predict price trends for the next 30 days"):
+        try:
+            with st.spinner("Generating price predictions..."):
+                # Get Flipkart predictions
+                if st.session_state.flipkart_selected_product:
+                    flipkart_product = st.session_state.flipkart_selected_product
+                    flipkart_price_text = flipkart_product['price_text']
+                    flipkart_price = float(flipkart_price_text.replace('₹', '').replace(',', '').strip().split('.')[0])
+                    
+                    try:
+                        st.session_state.price_predictions_flipkart = st.session_state.predictor.predict_future_price(
+                            product_name=flipkart_product['title'][:50],
+                            platform="Flipkart",
+                            current_price=flipkart_price,
+                            days_ahead=30
+                        )
+                    except Exception as e:
+                        st.error(f"Error predicting Flipkart prices: {str(e)}")
+                        st.session_state.price_predictions_flipkart = None
+                
+                # Get Amazon predictions  
+                if st.session_state.amazon_selected_product:
+                    amazon_product = st.session_state.amazon_selected_product
+                    amazon_price = amazon_product[1]
+                    
+                    try:
+                        st.session_state.price_predictions_amazon = st.session_state.predictor.predict_future_price(
+                            product_name=amazon_product[0][:50],
+                            platform="Amazon", 
+                            current_price=amazon_price,
+                            days_ahead=30
+                        )
+                    except Exception as e:
+                        st.error(f"Error predicting Amazon prices: {str(e)}")
+                        st.session_state.price_predictions_amazon = None
+                
+                # Check if any predictions were successful
+                if (st.session_state.price_predictions_flipkart is None and 
+                    st.session_state.price_predictions_amazon is None):
+                    st.error("Failed to generate price predictions for both platforms.")
+                else:
+                    st.success("Price predictions generated successfully! Scroll down to view the forecasts.")
+                    
+        except Exception as e:
+            st.error(f"An error occurred while generating predictions: {str(e)}")
+            st.session_state.price_predictions_flipkart = None
+            st.session_state.price_predictions_amazon = None
 
 
     # Price history simulation (only shown when products are selected)
